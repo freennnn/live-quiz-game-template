@@ -6,6 +6,8 @@ import type { RawData, WebSocket } from 'ws'
 import type {
   CreateGameData,
   Game,
+  JoinGameData,
+  Player,
   Question,
   RegData,
   User,
@@ -98,6 +100,36 @@ function sendError(ws: WebSocket, message: string) {
   send(ws, 'error', { message })
 }
 
+function broadcastToGameClients<TData>(game: Game, type: string, data: TData) {
+  const sockets: WebSocket[] = []
+
+  const hostWs = usersById.get(game.hostId)?.ws
+  if (hostWs && hostWs.readyState === hostWs.OPEN) sockets.push(hostWs)
+
+  for (const player of game.players) {
+    const playerWs = player.ws
+    if (playerWs && playerWs.readyState === playerWs.OPEN) sockets.push(playerWs)
+  }
+
+  for (const ws of sockets) {
+    send(ws, type, data)
+  }
+}
+
+function broadcastPlayerList(game: Game) {
+  const players: Array<Pick<Player, 'name' | 'index' | 'score'>> = game.players.map(
+    (p) => ({ name: p.name, index: p.index, score: p.score })
+  )
+  broadcastToGameClients(game, 'update_players', players)
+}
+
+function broadcastPlayerJoined(game: Game, playerName: string) {
+  broadcastToGameClients(game, 'player_joined', {
+    playerName,
+    playerCount: game.players.length,
+  })
+}
+
 function generateRoomCode(): string {
   const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
   let code = ''
@@ -113,6 +145,16 @@ function generateUniqueRoomCode(): string | null {
     if (!gamesByCode.has(code)) return code
   }
   return null
+}
+
+function safeParseJoinGameData(value: unknown): JoinGameData | null {
+  if (!isRecord(value)) return null
+  if (typeof value.code !== 'string') return null
+
+  const code = value.code.trim().toUpperCase()
+  if (!/^[A-Z0-9]{6}$/.test(code)) return null
+
+  return { code }
 }
 
 function safeParseRegData(value: unknown): RegData | null {
@@ -263,6 +305,57 @@ function handleCreateGame(ws: WebSocket, data: unknown) {
   send(ws, 'game_created', { gameId: game.id, code: game.code })
 }
 
+function handleJoinGame(ws: WebSocket, data: unknown) {
+  const user = getAuthedUser(ws)
+  if (!user) {
+    sendError(ws, 'Not registered. Please send {type:"reg"} first.')
+    return
+  }
+
+  const payload = safeParseJoinGameData(data)
+  if (!payload) {
+    sendError(ws, 'Invalid join_game payload. Expected { code: string }')
+    return
+  }
+
+  const game = gamesByCode.get(payload.code)
+  if (!game) {
+    sendError(ws, 'Game not found. Invalid code.')
+    return
+  }
+
+  if (game.status !== 'waiting') {
+    sendError(ws, 'Game already started or finished.')
+    return
+  }
+
+  if (game.hostId === user.index) {
+    sendError(ws, 'Host cannot join as a player.')
+    return
+  }
+
+  const existingPlayer = game.players.find((p) => p.index === user.index)
+  if (existingPlayer) {
+    existingPlayer.ws = ws
+    send(ws, 'game_joined', { gameId: game.id })
+    broadcastPlayerList(game)
+    return
+  }
+
+  const player: Player = {
+    name: user.name,
+    index: user.index,
+    score: 0,
+    ws,
+  }
+
+  game.players.push(player)
+
+  send(ws, 'game_joined', { gameId: game.id })
+  broadcastPlayerJoined(game, player.name)
+  broadcastPlayerList(game)
+}
+
 function onSocketMessage(ws: WebSocket, raw: RawData) {
   const msg = safeParseMessage(raw)
   if (!msg) {
@@ -278,6 +371,8 @@ function onSocketMessage(ws: WebSocket, raw: RawData) {
       handleCreateGame(ws, msg.data)
       break
     case 'join_game':
+      handleJoinGame(ws, msg.data)
+      break
     case 'start_game':
     case 'answer':
       sendError(ws, `Not implemented yet: ${msg.type}`)
