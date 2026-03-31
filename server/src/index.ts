@@ -36,6 +36,7 @@ const gamesByCode = new Map<string, Game>()
 
 const BASE_POINTS = 1000
 const RESULT_DELAY_MS = 2000
+const MAX_PLAYERS_PER_GAME = 50
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === 'object'
@@ -106,18 +107,17 @@ function sendError(ws: WebSocket, message: string) {
 }
 
 function broadcastToGameClients<TData>(game: Game, type: string, data: TData) {
-  const sockets: WebSocket[] = []
+  const sockets = new Set<WebSocket>()
 
   const hostWs = usersById.get(game.hostId)?.ws
-  if (hostWs && hostWs.readyState === hostWs.OPEN) sockets.push(hostWs)
+  if (hostWs && hostWs.readyState === hostWs.OPEN) sockets.add(hostWs)
 
   for (const player of game.players) {
     const playerWs = player.ws
-    if (playerWs && playerWs.readyState === playerWs.OPEN)
-      sockets.push(playerWs)
+    if (playerWs && playerWs.readyState === playerWs.OPEN) sockets.add(playerWs)
   }
 
-  for (const ws of sockets) {
+  for (const ws of sockets.values()) {
     send(ws, type, data)
   }
 }
@@ -633,6 +633,11 @@ function handleJoinGame(ws: WebSocket, data: unknown) {
     existingPlayer.ws = ws
     send(ws, 'game_joined', { gameId: game.id })
     broadcastPlayerList(game)
+    return
+  }
+
+  if (game.players.length >= MAX_PLAYERS_PER_GAME) {
+    sendError(ws, 'Game is full.')
     return
   }
 
