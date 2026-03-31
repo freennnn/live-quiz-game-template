@@ -4,6 +4,7 @@ import { WebSocketServer } from 'ws'
 import type { RawData, WebSocket } from 'ws'
 
 import type {
+  AnswerData,
   CreateGameData,
   Game,
   JoinGameData,
@@ -179,6 +180,25 @@ function safeParseStartGameData(value: unknown): StartGameData | null {
   return { gameId }
 }
 
+function safeParseAnswerData(value: unknown): AnswerData | null {
+  if (!isRecord(value)) return null
+  if (typeof value.gameId !== 'string') return null
+  if (typeof value.questionIndex !== 'number') return null
+  if (typeof value.answerIndex !== 'number') return null
+
+  const gameId = value.gameId.trim()
+  if (gameId.length === 0) return null
+
+  const questionIndex = value.questionIndex
+  if (!Number.isInteger(questionIndex) || questionIndex < 0) return null
+
+  const answerIndex = value.answerIndex
+  if (!Number.isInteger(answerIndex) || answerIndex < 0 || answerIndex > 3)
+    return null
+
+  return { gameId, questionIndex, answerIndex }
+}
+
 function safeParseRegData(value: unknown): RegData | null {
   if (!isRecord(value)) return null
   if (typeof value.name !== 'string') return null
@@ -351,6 +371,79 @@ function startQuestion(game: Game, questionIndex: number) {
   }, question.timeLimitSec * 1000)
 }
 
+function handleAnswer(ws: WebSocket, data: unknown) {
+  const user = getAuthedUser(ws)
+  if (!user) {
+    sendError(ws, 'Not registered. Please send {type:"reg"} first.')
+    return
+  }
+
+  const payload = safeParseAnswerData(data)
+  if (!payload) {
+    sendError(
+      ws,
+      'Invalid answer payload. Expected { gameId: string, questionIndex: number, answerIndex: number }',
+    )
+    return
+  }
+
+  const game = gamesById.get(payload.gameId)
+  if (!game) {
+    sendError(ws, 'Game not found.')
+    return
+  }
+
+  if (game.status !== 'in_progress') {
+    sendError(ws, 'Game is not in progress.')
+    return
+  }
+
+  if (!game.questionTimer) {
+    sendError(ws, 'Question is not accepting answers right now.')
+    return
+  }
+
+  if (payload.questionIndex !== game.currentQuestion) {
+    sendError(ws, 'Answer is for a different question.')
+    return
+  }
+
+  if (game.hostId === user.index) {
+    sendError(ws, 'Host cannot answer questions.')
+    return
+  }
+
+  const player = game.players.find((p) => p.index === user.index)
+  if (!player) {
+    sendError(ws, 'You are not a player in this game.')
+    return
+  }
+
+  // Only accept the first answer per player per question.
+  if (game.playerAnswers.has(player.index)) {
+    sendError(ws, 'Answer already submitted for this question.')
+    return
+  }
+
+  const timestamp = Date.now()
+  game.playerAnswers.set(player.index, {
+    answerIndex: payload.answerIndex,
+    timestamp,
+  })
+
+  // Keep the player's ws up to date (reconnects): if reloaded tab, or logs in second tab
+  player.ws = ws
+
+  send(ws, 'answer_accepted', { questionIndex: payload.questionIndex })
+
+  // Early end: if everyone answered, end immediately.
+  if (game.playerAnswers.size >= game.players.length) {
+    clearTimeout(game.questionTimer)
+    game.questionTimer = undefined
+    endQuestion(game)
+  }
+}
+
 function handleJoinGame(ws: WebSocket, data: unknown) {
   const user = getAuthedUser(ws)
   if (!user) {
@@ -461,7 +554,7 @@ function onSocketMessage(ws: WebSocket, raw: RawData) {
       handleStartGame(ws, msg.data)
       break
     case 'answer':
-      sendError(ws, `Not implemented yet: ${msg.type}`)
+      handleAnswer(ws, msg.data)
       break
     default:
       sendError(ws, `Unknown message type: ${msg.type}`)
