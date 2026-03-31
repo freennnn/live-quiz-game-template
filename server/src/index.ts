@@ -3,7 +3,14 @@ import { randomUUID } from 'node:crypto'
 import { WebSocketServer } from 'ws'
 import type { RawData, WebSocket } from 'ws'
 
-import type { RegData, User, WSMessage } from './types.js'
+import type {
+  CreateGameData,
+  Game,
+  Question,
+  RegData,
+  User,
+  WSMessage,
+} from './types.js'
 
 type OutgoingMessage<TData> = {
   type: string
@@ -20,6 +27,9 @@ const usersByName = new Map<string, User>()
 const usersById = new Map<string, User>()
 const wsToUserId = new WeakMap<WebSocket, string>() // socket to logged-in user.id
 
+const gamesById = new Map<string, Game>()
+const gamesByCode = new Map<string, Game>()
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === 'object'
 }
@@ -32,6 +42,17 @@ function putUser(user: User) {
 function bindUserToSocket(user: User, ws: WebSocket) {
   user.ws = ws
   wsToUserId.set(ws, user.index)
+}
+
+function getAuthedUser(ws: WebSocket): User | null {
+  const userId = wsToUserId.get(ws)
+  if (!userId) return null
+  return usersById.get(userId) ?? null
+}
+
+function putGame(game: Game) {
+  gamesById.set(game.id, game)
+  gamesByCode.set(game.code, game)
 }
 
 function isWSMessage(value: unknown): value is WSMessage {
@@ -75,6 +96,23 @@ function send<TData>(ws: WebSocket, type: string, data: TData) {
 
 function sendError(ws: WebSocket, message: string) {
   send(ws, 'error', { message })
+}
+
+function generateRoomCode(): string {
+  const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
+  let code = ''
+  for (let i = 0; i < 6; i++) {
+    code += alphabet[Math.floor(Math.random() * alphabet.length)]
+  }
+  return code
+}
+
+function generateUniqueRoomCode(): string | null {
+  for (let i = 0; i < 50; i++) {
+    const code = generateRoomCode()
+    if (!gamesByCode.has(code)) return code
+  }
+  return null
 }
 
 function safeParseRegData(value: unknown): RegData | null {
@@ -145,6 +183,86 @@ function handleReg(ws: WebSocket, data: unknown) {
   })
 }
 
+function safeParseQuestion(value: unknown): Question | null {
+  if (!isRecord(value)) return null
+  if (typeof value.text !== 'string') return null
+  if (!Array.isArray(value.options)) return null
+  if (typeof value.correctIndex !== 'number') return null
+  if (typeof value.timeLimitSec !== 'number') return null
+
+  const text = value.text.trim()
+  if (text.length === 0) return null
+
+  const options = value.options
+  if (options.length !== 4) return null
+  if (!options.every((opt) => typeof opt === 'string')) return null
+
+  const correctIndex = value.correctIndex
+  if (!Number.isInteger(correctIndex) || correctIndex < 0 || correctIndex > 3)
+    return null
+
+  const timeLimitSec = value.timeLimitSec
+  if (!Number.isFinite(timeLimitSec) || timeLimitSec <= 0) return null
+
+  return {
+    text,
+    options: options as string[],
+    correctIndex,
+    timeLimitSec,
+  }
+}
+
+function safeParseCreateGameData(value: unknown): CreateGameData | null {
+  if (!isRecord(value)) return null
+  if (!Array.isArray(value.questions)) return null
+
+  const questions: Question[] = []
+  for (const q of value.questions) {
+    const parsed = safeParseQuestion(q)
+    if (!parsed) return null
+    questions.push(parsed)
+  }
+
+  if (questions.length === 0) return null
+
+  return { questions }
+}
+
+function handleCreateGame(ws: WebSocket, data: unknown) {
+  const user = getAuthedUser(ws)
+  if (!user) {
+    sendError(ws, 'Not registered. Please send {type:"reg"} first.')
+    return
+  }
+
+  const payload = safeParseCreateGameData(data)
+  if (!payload) {
+    sendError(ws, 'Invalid create_game payload.')
+    return
+  }
+
+  const code = generateUniqueRoomCode()
+  if (!code) {
+    sendError(ws, 'Failed to generate room code. Try again.')
+    return
+  }
+
+  const game: Game = {
+    id: randomUUID(),
+    code,
+    hostId: user.index,
+    questions: payload.questions,
+    players: [],
+    currentQuestion: -1,
+    status: 'waiting',
+    playerAnswers: new Map(),
+  }
+
+  putGame(game)
+
+  send(ws, 'game_created', { gameId: game.id, code: game.code })
+}
+
 function onSocketMessage(ws: WebSocket, raw: RawData) {
   const msg = safeParseMessage(raw)
   if (!msg) {
@@ -157,6 +275,8 @@ function onSocketMessage(ws: WebSocket, raw: RawData) {
       handleReg(ws, msg.data)
       break
     case 'create_game':
+      handleCreateGame(ws, msg.data)
+      break
     case 'join_game':
     case 'start_game':
     case 'answer':
