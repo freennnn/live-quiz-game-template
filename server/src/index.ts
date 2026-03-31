@@ -10,6 +10,7 @@ import type {
   Player,
   Question,
   RegData,
+  StartGameData,
   User,
   WSMessage,
 } from './types.js'
@@ -108,7 +109,8 @@ function broadcastToGameClients<TData>(game: Game, type: string, data: TData) {
 
   for (const player of game.players) {
     const playerWs = player.ws
-    if (playerWs && playerWs.readyState === playerWs.OPEN) sockets.push(playerWs)
+    if (playerWs && playerWs.readyState === playerWs.OPEN)
+      sockets.push(playerWs)
   }
 
   for (const ws of sockets) {
@@ -117,9 +119,8 @@ function broadcastToGameClients<TData>(game: Game, type: string, data: TData) {
 }
 
 function broadcastPlayerList(game: Game) {
-  const players: Array<Pick<Player, 'name' | 'index' | 'score'>> = game.players.map(
-    (p) => ({ name: p.name, index: p.index, score: p.score })
-  )
+  const players: Array<Pick<Player, 'name' | 'index' | 'score'>> =
+    game.players.map((p) => ({ name: p.name, index: p.index, score: p.score }))
   broadcastToGameClients(game, 'update_players', players)
 }
 
@@ -127,6 +128,19 @@ function broadcastPlayerJoined(game: Game, playerName: string) {
   broadcastToGameClients(game, 'player_joined', {
     playerName,
     playerCount: game.players.length,
+  })
+}
+
+function broadcastQuestion(game: Game) {
+  const question = game.questions[game.currentQuestion]
+  if (!question) return
+
+  broadcastToGameClients(game, 'question', {
+    questionNumber: game.currentQuestion + 1,
+    totalQuestions: game.questions.length,
+    text: question.text,
+    options: question.options,
+    timeLimitSec: question.timeLimitSec,
   })
 }
 
@@ -155,6 +169,14 @@ function safeParseJoinGameData(value: unknown): JoinGameData | null {
   if (!/^[A-Z0-9]{6}$/.test(code)) return null
 
   return { code }
+}
+
+function safeParseStartGameData(value: unknown): StartGameData | null {
+  if (!isRecord(value)) return null
+  if (typeof value.gameId !== 'string') return null
+  const gameId = value.gameId.trim()
+  if (gameId.length === 0) return null
+  return { gameId }
 }
 
 function safeParseRegData(value: unknown): RegData | null {
@@ -305,6 +327,30 @@ function handleCreateGame(ws: WebSocket, data: unknown) {
   send(ws, 'game_created', { gameId: game.id, code: game.code })
 }
 
+function endQuestion(_game: Game) {
+  // Implemented in later steps (question_result + scoring + advance)
+}
+
+function startQuestion(game: Game, questionIndex: number) {
+  if (game.questionTimer) {
+    clearTimeout(game.questionTimer)
+    game.questionTimer = undefined
+  }
+
+  game.currentQuestion = questionIndex
+  game.questionStartTime = Date.now()
+  game.playerAnswers = new Map()
+
+  broadcastQuestion(game)
+
+  const question = game.questions[game.currentQuestion]
+  if (!question) return
+
+  game.questionTimer = setTimeout(() => {
+    endQuestion(game)
+  }, question.timeLimitSec * 1000)
+}
+
 function handleJoinGame(ws: WebSocket, data: unknown) {
   const user = getAuthedUser(ws)
   if (!user) {
@@ -356,6 +402,44 @@ function handleJoinGame(ws: WebSocket, data: unknown) {
   broadcastPlayerList(game)
 }
 
+function handleStartGame(ws: WebSocket, data: unknown) {
+  const user = getAuthedUser(ws)
+  if (!user) {
+    sendError(ws, 'Not registered. Please send {type:"reg"} first.')
+    return
+  }
+
+  const payload = safeParseStartGameData(data)
+  if (!payload) {
+    sendError(ws, 'Invalid start_game payload. Expected { gameId: string }')
+    return
+  }
+
+  const game = gamesById.get(payload.gameId)
+  if (!game) {
+    sendError(ws, 'Game not found.')
+    return
+  }
+
+  if (game.hostId !== user.index) {
+    sendError(ws, 'Only the host can start the game.')
+    return
+  }
+
+  if (game.status !== 'waiting') {
+    sendError(ws, 'Game already started or finished.')
+    return
+  }
+
+  if (game.players.length < 1) {
+    sendError(ws, 'Cannot start game without players.')
+    return
+  }
+
+  game.status = 'in_progress'
+  startQuestion(game, 0)
+}
+
 function onSocketMessage(ws: WebSocket, raw: RawData) {
   const msg = safeParseMessage(raw)
   if (!msg) {
@@ -374,6 +458,8 @@ function onSocketMessage(ws: WebSocket, raw: RawData) {
       handleJoinGame(ws, msg.data)
       break
     case 'start_game':
+      handleStartGame(ws, msg.data)
+      break
     case 'answer':
       sendError(ws, `Not implemented yet: ${msg.type}`)
       break
